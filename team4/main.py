@@ -61,7 +61,7 @@ def search_naver(query):
     }
     params = {
         "query": query,
-        "display": 5  # 필요한 결과 수
+        "display": 6  # 필요한 결과 수
     }
     response = requests.get("https://openapi.naver.com/v1/search/webkr.json", headers=headers, params=params)
 
