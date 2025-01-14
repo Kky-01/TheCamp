@@ -1,15 +1,27 @@
 from flask import Flask, request, jsonify, render_template
-import requests
 import openai
+import requests
+from concurrent.futures import ThreadPoolExecutor
+from dotenv import load_dotenv
+import os
 
 app = Flask(__name__)
 
-# API 키 설정
-GEMINI_API_KEY = ""
-YOUTUBE_API_KEY = ""
-NAVER_CLIENT_ID = ""
-NAVER_CLIENT_SECRET = ""
-openai.api_key = GEMINI_API_KEY
+# Load API keys from .env file
+load_dotenv()  # .env 파일 로드
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY")
+NAVER_CLIENT_ID = os.getenv("NAVER_CLIENT_ID")
+NAVER_CLIENT_SECRET = os.getenv("NAVER_CLIENT_SECRET")
+
+if not OPENAI_API_KEY:
+    print("[ERROR] OPENAI_API_KEY is not set. Check your .env file.")
+if not YOUTUBE_API_KEY:
+    print("[ERROR] YOUTUBE_API_KEY is not set. Check your .env file.")
+if not NAVER_CLIENT_ID:
+    print("[ERROR] NAVER_CLIENT_ID is not set. Check your .env file.")
+if not NAVER_CLIENT_SECRET:
+    print("[ERROR] NAVER_CLIENT_SECRET is not set. Check your .env file.")
 
 # 태그 저장용 리스트
 user_tags = []
@@ -17,97 +29,134 @@ user_tags = []
 # LLM을 이용한 검색 쿼리 최적화
 def refine_query_with_llm(user_query):
     try:
+        print(f"[INFO] Original query: {user_query}")
         response = openai.ChatCompletion.create(
-            model="gpt-4",
+            model="gpt-4",  # 기본적으로 gpt-4 사용
             messages=[
                 {"role": "system", "content": "You are a helpful assistant."},
                 {"role": "user", "content": f"Optimize this search query for YouTube: '{user_query}'"}
             ]
         )
-        refined_query = response["choices"][0]["message"]["content"].strip()
+        refined_query = response['choices'][0]['message']['content'].strip()
+        print(f"[INFO] Refined query: {refined_query}")
         return refined_query
     except Exception as e:
-        print(f"Error refining query: {e}")
-        return user_query
+        print(f"[ERROR] Error refining query with gpt-4: {e}")
+        print("[INFO] Falling back to gpt-3.5-turbo.")
+        try:
+            response = openai.ChatCompletion.create(
+                model="gpt-3.5-turbo",  # 대체 모델
+                messages=[
+                    {"role": "system", "content": "You are a helpful assistant."},
+                    {"role": "user", "content": f"Optimize this search query for YouTube: '{user_query}'"}
+                ]
+            )
+            refined_query = response['choices'][0]['message']['content'].strip()
+            print(f"[INFO] Refined query using fallback model: {refined_query}")
+            return refined_query
+        except Exception as fallback_e:
+            print(f"[ERROR] Error refining query with fallback model: {fallback_e}")
+            return user_query  # 원본 쿼리 반환
+
+
 
 # 콘텐츠 필터링 Agent
-def filter_results_with_llm(query, results):
-    try:
-        filtered_results = []
-        for result in results:
+def filter_results_with_llm_parallel(query, results):
+    def process_result(result):
+        try:
             content_title = result['snippet']['title']
             response = openai.ChatCompletion.create(
                 model="gpt-4",
                 messages=[
                     {"role": "system", "content": "You are a helpful assistant."},
-                    {"role": "user", "content": f"Does this content closely relate to '{query}'? Content: '{content_title}'. Respond with 'Yes' or 'No'."}
+                    {"role": "user", "content": f"Does this content closely relate to '{query}'? Content: '{content_title}'."}
                 ]
             )
-            relevance = response["choices"][0]["message"]["content"].strip()
-            if relevance.lower() == "yes":
-                filtered_results.append(result)
-            if len(filtered_results) >= 15:  # 최대 15개 콘텐츠 제한
-                break
-        return filtered_results
-    except Exception as e:
-        print(f"Error filtering results: {e}")
-        return results[:15]
+            relevance = response['choices'][0]['message']['content'].strip().lower()
+            return result if "yes" in relevance else None
+        except Exception as e:
+            print(f"[ERROR] Error processing result: {e}")
+            return result  # 실패 시 기본적으로 포함
+
+    filtered_results = []
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        futures = [executor.submit(process_result, result) for result in results]
+        for future in futures:
+            processed_result = future.result()
+            if processed_result:
+                filtered_results.append(processed_result)
+                if len(filtered_results) >= 15:
+                    break
+    return filtered_results
+
+
 
 # 네이버 검색 API 호출 함수
 def search_naver(query):
-    headers = {
-        "X-Naver-Client-Id": NAVER_CLIENT_ID,
-        "X-Naver-Client-Secret": NAVER_CLIENT_SECRET
-    }
-    params = {
-        "query": query,
-        "display": 6  # 필요한 결과 수
-    }
-    response = requests.get("https://openapi.naver.com/v1/search/webkr.json", headers=headers, params=params)
-
-    if response.status_code == 200:
-        items = response.json().get("items", [])
-        # 네이버 결과를 JSON 형태로 변환
-        return [{"link": item["link"], "description": item["title"]} for item in items]
-    else:
-        print(f"Naver API Error: {response.status_code}")
+    try:
+        headers = {
+            "X-Naver-Client-Id": NAVER_CLIENT_ID,
+            "X-Naver-Client-Secret": NAVER_CLIENT_SECRET
+        }
+        params = {
+            "query": query,
+            "display": 6
+        }
+        response = requests.get("https://openapi.naver.com/v1/search/webkr.json", headers=headers, params=params)
+        if response.status_code == 200:
+            print(f"[INFO] Naver API response: {response.json()}")  # 응답 로그
+            items = response.json().get("items", [])
+            return [{"link": item["link"], "description": item["title"]} for item in items]
+        else:
+            print(f"[ERROR] Naver API Error: {response.status_code}, {response.text}")  # 에러 로그
+            return []
+    except Exception as e:
+        print(f"[ERROR] Exception during Naver API call: {e}")  # 예외 로그
         return []
 
+# 호출
+@app.route('/')
+def home():
+    return render_template('index.html')
 
 # 검색 API
 @app.route('/search', methods=['POST'])
 def search():
-    query = request.json.get('query')
-    if not query:
-        return jsonify({"error": "Query is required"}), 400
+    try:
+        query = request.json.get('query')
+        if not query:
+            print("[ERROR] Query not provided in request.")
+            return jsonify({"error": "Query is required"}), 400
 
-    # LLM으로 검색 쿼리 최적화
-    refined_query = refine_query_with_llm(query)
+        print(f"[INFO] Received search query: {query}")
 
-    # 대화 메시지 생성
-    llm_conversation = [
-        {"role": "user", "content": f"사용자가 입력한 검색어: '{query}'"},
-        {"role": "bot", "content": f"LLM이 최적화한 검색어: '{refined_query}'"}
-    ]
+        # LLM으로 검색 쿼리 최적화
+        refined_query = refine_query_with_llm(query)
 
-    # YouTube API 호출
-    youtube_api_url = f"https://www.googleapis.com/youtube/v3/search?part=snippet&maxResults=50&q={refined_query}&key={YOUTUBE_API_KEY}"
-    youtube_response = requests.get(youtube_api_url)
-    if youtube_response.status_code != 200:
-        return jsonify({"error": "Failed to fetch data from YouTube API"}), 500
+        # YouTube API 호출
+        youtube_api_url = f"https://www.googleapis.com/youtube/v3/search?part=snippet&maxResults=50&q={refined_query}&key={YOUTUBE_API_KEY}"
+        youtube_response = requests.get(youtube_api_url)
+        if youtube_response.status_code != 200:
+            print(f"[ERROR] YouTube API Error: {youtube_response.status_code}, {youtube_response.text}")
+            return jsonify({"error": "Failed to fetch data from YouTube API"}), 500
 
-    youtube_videos = youtube_response.json().get("items", [])
-    filtered_videos = filter_results_with_llm(query, youtube_videos)
+        youtube_videos = youtube_response.json().get("items", [])
+        print(f"[INFO] YouTube API returned {len(youtube_videos)} results.")
 
-    # 네이버 검색 API 호출
-    naver_results = search_naver(query)
-    # JSON 응답 반환
-    return jsonify({
-        "llm_conversation": llm_conversation,
-        "youtube": filtered_videos,
-        "naver": naver_results
-    })
-    # return jsonify({"youtube": filtered_videos, "naver": naver_results})
+        # 병렬로 콘텐츠 필터링
+        filtered_videos = filter_results_with_llm_parallel(query, youtube_videos)
+
+        # 네이버 검색 API 호출
+        naver_results = search_naver(query)
+        print(f"[INFO] Naver API returned {len(naver_results)} results.")
+
+        return jsonify({
+            "youtube": filtered_videos,
+            "naver": naver_results
+        })
+    except Exception as e:
+        print(f"[ERROR] Exception in search endpoint: {e}")
+        return jsonify({"error": "An unexpected error occurred."}), 500
 
 # 태그 추가 API
 @app.route('/add-tag', methods=['POST'])
@@ -147,10 +196,6 @@ def recommend():
     print(recommendations)
     return jsonify({"tags": user_tags, "recommendations": recommendations})
 
-# 메인 페이지
-@app.route('/')
-def home():
-    return render_template('index.html')
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5001, debug=True)
